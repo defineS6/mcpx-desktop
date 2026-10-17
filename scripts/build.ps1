@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $frontend = Join-Path $root 'internal\desktop\frontend'
 
+# 编译前关闭正在运行的旧实例，防止 Windows 文件句柄占用导致生成 ~ 备份文件
+Get-Process -Name mcpx-desktop -ErrorAction SilentlyContinue | Stop-Process -Force
+
 # 1. 编译前端资源
 Push-Location $frontend
 try {
@@ -27,6 +30,7 @@ try {
     $env:CGO_ENABLED = '0'
     go build -trimpath -ldflags "-H windowsgui -s -w -X main.version=$Version" -o bin/mcpx-desktop.exe ./cmd/mcpx-desktop
     if ($LASTEXITCODE -ne 0) { throw "Go build failed" }
+    Remove-Item -Path (Join-Path $root 'bin\*~') -Force -ErrorAction SilentlyContinue
     Write-Output "Build completed: $(Join-Path $root 'bin\mcpx-desktop.exe')"
 } finally {
     $env:CGO_ENABLED = $oldCGO

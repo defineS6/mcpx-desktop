@@ -1,6 +1,8 @@
 /bin/
 /release/
 *.exe
+*.exe~
+*~
 *.test
 *.syso
 /internal/desktop/frontend/node_modules/
