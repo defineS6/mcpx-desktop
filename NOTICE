@@ -1,0 +1,11 @@
+MCPX Desktop
+https://github.com/defineS6/mcpx-desktop
+
+本项目从 opentokenz/mcpx v0.9.18 的桌面管理模块派生。
+上游项目：https://github.com/opentokenz/mcpx
+基线提交：d17e68a59bbe63aa94bfec595957180422ca242f
+许可：Apache License 2.0，完整许可见 LICENSE。
+
+独立维护内容包括：外部 Runtime 发现与控制、配置无损写入、
+进程完整路径核验、无窗口启动及 Tunnel 生命周期解耦。
+本项目不包含或分发用户的 Token、OAuth 凭据和运行数据库。

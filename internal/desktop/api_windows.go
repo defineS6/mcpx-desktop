@@ -1,0 +1,682 @@
+//go:build windows
+
+package desktop
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"github.com/defineS6/mcpx-desktop/internal/config"
+)
+
+// maxLogChunk 限制单次日志读取的字节数。前端是 1s 轮询增量拉取，一次给太多
+// 反而会让首屏卡住。
+const maxLogChunk = 256 << 10
+
+// api 是挂在 Wails AssetServer `/api` 路由上的处理器。前端全部通过普通 fetch
+// 调用它，因此不需要 Wails 的绑定代码生成。
+//
+// 注意：AssetServer 在转发前会把 `/api` 前缀 TrimPrefix 掉，所以下面注册的
+// 路由都不带 `/api`。
+type api struct {
+	mux *http.ServeMux
+
+	// app 在 application.New 返回后回填。目录选择器等能力必须通过它调用。
+	mu  sync.Mutex
+	app *application.App
+}
+
+// --- Cloudflare Tunnel ---
+
+func (a *api) handleCloudflareStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, currentCloudflareState())
+}
+
+func (a *api) handleGetCloudflareConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, err := loadCloudflareDesktopConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (a *api) handlePutCloudflareConfig(w http.ResponseWriter, r *http.Request) {
+	var body cloudflareDesktopConfig
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	old, err := loadCloudflareDesktopConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if body.LastPublicURL == "" {
+		body.LastPublicURL = old.LastPublicURL
+	}
+	// DesiredRunning 是后台运行意图，不暴露给前端表单，保存 UI 配置时必须保留。
+	body.DesiredRunning = old.DesiredRunning
+	saved, err := saveCloudflareDesktopConfig(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (a *api) handleInstallCloudflared(w http.ResponseWriter, r *http.Request) {
+	status, err := installCloudflared()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (a *api) handleUninstallCloudflared(w http.ResponseWriter, r *http.Request) {
+	status, err := uninstallManagedCloudflared()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (a *api) handleStartCloudflare(w http.ResponseWriter, r *http.Request) {
+	state, err := startCloudflareTunnel()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (a *api) handleStopCloudflare(w http.ResponseWriter, r *http.Request) {
+	if err := stopCloudflareTunnel(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, currentCloudflareState())
+}
+
+func (a *api) handleCloudflareHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, runCloudflareHealthCheck())
+}
+
+func (a *api) handleReadCloudflareLogs(w http.ResponseWriter, r *http.Request) {
+	state := currentCloudflareState()
+	writeLogChunk(w, state.LogPath, r.URL.Query().Get("offset"))
+}
+
+func (a *api) handleClearCloudflareLogs(w http.ResponseWriter, r *http.Request) {
+	state := currentCloudflareState()
+	if state.LogPath == "" {
+		writeError(w, http.StatusInternalServerError, "无法定位 Cloudflare 日志路径")
+		return
+	}
+	if err := os.Truncate(state.LogPath, 0); err != nil && !os.IsNotExist(err) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func writeLogChunk(w http.ResponseWriter, path, rawOffset string) {
+	if path == "" {
+		writeError(w, http.StatusInternalServerError, "无法定位日志路径")
+		return
+	}
+	offset, _ := strconv.ParseInt(rawOffset, 10, 64)
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, map[string]any{"content": "", "offset": 0, "next_offset": 0, "size": 0})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	size := info.Size()
+	if offset > size || offset < 0 {
+		offset = 0
+	}
+	if size-offset > maxLogChunk {
+		offset = size - maxLogChunk
+	}
+	buf := make([]byte, size-offset)
+	read, readErr := file.ReadAt(buf, offset)
+	if readErr != nil && read == 0 {
+		buf = buf[:0]
+		read = 0
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"content": string(buf[:read]), "offset": offset,
+		"next_offset": offset + int64(read), "size": size,
+	})
+}
+
+func newAPI() *api {
+	a := &api{mux: http.NewServeMux()}
+
+	a.mux.HandleFunc("GET /status", a.handleStatus)
+	a.mux.HandleFunc("POST /service/{action}", a.handleServiceAction)
+	a.mux.HandleFunc("GET /runtime", a.handleRuntime)
+	a.mux.HandleFunc("PUT /runtime", a.handlePutRuntime)
+	a.mux.HandleFunc("POST /runtime/pick", a.handlePickRuntime)
+
+	a.mux.HandleFunc("GET /workspaces", a.handleListWorkspaces)
+	a.mux.HandleFunc("POST /workspaces", a.handleAddWorkspace)
+	a.mux.HandleFunc("PATCH /workspaces/{name}", a.handlePatchWorkspace)
+	a.mux.HandleFunc("DELETE /workspaces/{name}", a.handleDeleteWorkspace)
+	a.mux.HandleFunc("POST /pick-directory", a.handlePickDirectory)
+
+	a.mux.HandleFunc("GET /logs", a.handleReadLogs)
+	a.mux.HandleFunc("POST /logs/clear", a.handleClearLogs)
+
+	a.mux.HandleFunc("GET /config", a.handleGetConfig)
+	a.mux.HandleFunc("PUT /config", a.handlePutConfig)
+	a.mux.HandleFunc("POST /config/token", a.handleGenerateToken)
+
+	a.mux.HandleFunc("GET /cloudflare/status", a.handleCloudflareStatus)
+	a.mux.HandleFunc("GET /cloudflare/config", a.handleGetCloudflareConfig)
+	a.mux.HandleFunc("PUT /cloudflare/config", a.handlePutCloudflareConfig)
+	a.mux.HandleFunc("POST /cloudflare/install", a.handleInstallCloudflared)
+	a.mux.HandleFunc("POST /cloudflare/uninstall", a.handleUninstallCloudflared)
+	a.mux.HandleFunc("POST /cloudflare/start", a.handleStartCloudflare)
+	a.mux.HandleFunc("POST /cloudflare/stop", a.handleStopCloudflare)
+	a.mux.HandleFunc("POST /cloudflare/health", a.handleCloudflareHealth)
+	a.mux.HandleFunc("GET /cloudflare/logs", a.handleReadCloudflareLogs)
+	a.mux.HandleFunc("POST /cloudflare/logs/clear", a.handleClearCloudflareLogs)
+
+	a.mux.HandleFunc("POST /open", a.handleOpenPath)
+	return a
+}
+
+// ServeHTTP 串行处理写入和生命周期操作，防止界面、托盘与自动恢复互相覆盖。
+func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		writeError(w, http.StatusForbidden, "拒绝跨站调用桌面管理接口")
+		return
+	}
+	if r.Method != http.MethodGet && r.URL.Path != "/cloudflare/health" {
+		_ = withLifecycle(func() error { a.mux.ServeHTTP(w, r); return nil })
+		return
+	}
+	a.mux.ServeHTTP(w, r)
+}
+
+func (a *api) setApp(app *application.App) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.app = app
+}
+
+func (a *api) application() *application.App {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.app
+}
+
+// --- 服务状态与控制 ---
+
+func (a *api) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, currentState())
+}
+
+// handleRuntime 返回独立内核的发现结果，不启动服务。
+func (a *api) handleRuntime(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, currentRuntimeInfo())
+}
+
+// handlePutRuntime 保存内核路径；服务或 Tunnel 运行时禁止切换。
+func (a *api) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if managed(currentState()) || cloudflareManaged(currentCloudflareState()) {
+		writeError(w, http.StatusConflict, "请先停止 MCPX 和 Tunnel，再修改内核路径")
+		return
+	}
+	if err := saveRuntimePath(body.Path); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a.handleRuntime(w, r)
+}
+
+// handlePickRuntime 选择官方内核，用户取消时返回空路径。
+func (a *api) handlePickRuntime(w http.ResponseWriter, r *http.Request) {
+	app := a.application()
+	if app == nil {
+		writeError(w, http.StatusServiceUnavailable, "窗口尚未就绪")
+		return
+	}
+	path, err := app.Dialog.OpenFile().SetTitle("选择 MCPX 内核 mcpx.exe").CanChooseFiles(true).CanChooseDirectories(false).PromptForSingleSelection()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": path})
+}
+
+func (a *api) handleServiceAction(w http.ResponseWriter, r *http.Request) {
+	var err error
+	switch r.PathValue("action") {
+	case "start":
+		err = startMCPXStack()
+	case "stop":
+		err = stopMCPXStack()
+	case "restart":
+		err = restartMCPXStack()
+	default:
+		writeError(w, http.StatusNotFound, "未知操作")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, currentState())
+}
+
+// --- Workspace ---
+
+type workspaceItem struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Description string `json:"description"`
+	// Missing 标记路径已不存在。注册记录本身仍然保留，由用户决定要不要删。
+	Missing bool `json:"missing"`
+}
+
+func (a *api) handleListWorkspaces(w http.ResponseWriter, r *http.Request) {
+	cfg, err := config.LoadGlobal("")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("读取配置失败：%v", err))
+		return
+	}
+	items := make([]workspaceItem, 0, len(cfg.Workspaces))
+	for _, entry := range cfg.Workspaces {
+		path := config.ExpandHome(entry.Path)
+		info, statErr := os.Stat(path)
+		items = append(items, workspaceItem{
+			Name:        entry.Name,
+			Path:        entry.Path,
+			Description: entry.Description,
+			Missing:     statErr != nil || !info.IsDir(),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (a *api) handleAddWorkspace(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path        string `json:"path"`
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	path := strings.TrimSpace(body.Path)
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "路径不能为空")
+		return
+	}
+	absPath, err := filepath.Abs(config.ExpandHome(path))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("解析路径失败：%v", err))
+		return
+	}
+	info, err := os.Stat(absPath)
+	if err != nil || !info.IsDir() {
+		writeError(w, http.StatusBadRequest, "目录不存在")
+		return
+	}
+
+	// 配置层校验目录与重名，并在无损写入时自动备份。
+	if err := config.RegisterWorkspace("", absPath); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("注册失败：%v", err))
+		return
+	}
+	if description := strings.TrimSpace(body.Description); description != "" {
+		if err := updateWorkspace(filepath.Base(absPath), func(entry *config.WorkspaceEntry) {
+			entry.Description = description
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	a.handleListWorkspaces(w, r)
+}
+
+func (a *api) handlePatchWorkspace(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	err := updateWorkspace(r.PathValue("name"), func(entry *config.WorkspaceEntry) {
+		entry.Description = strings.TrimSpace(body.Description)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.handleListWorkspaces(w, r)
+}
+
+// handleDeleteWorkspace 只从 config.yaml 移除注册记录，绝不触碰磁盘上的项目目录。
+func (a *api) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	configPath, cfg, err := loadGlobalForWrite()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	kept := make([]config.WorkspaceEntry, 0, len(cfg.Workspaces))
+	found := false
+	for _, entry := range cfg.Workspaces {
+		if entry.Name == name {
+			found = true
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "Workspace 不存在")
+		return
+	}
+	cfg.Workspaces = kept
+	if err := config.WriteGlobal(configPath, cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入配置失败：%v", err))
+		return
+	}
+	a.handleListWorkspaces(w, r)
+}
+
+// handlePickDirectory 弹出系统目录选择器。用户取消时返回空路径而不是错误。
+func (a *api) handlePickDirectory(w http.ResponseWriter, r *http.Request) {
+	app := a.application()
+	if app == nil {
+		writeError(w, http.StatusServiceUnavailable, "窗口尚未就绪")
+		return
+	}
+	path, err := app.Dialog.OpenFile().
+		SetTitle("选择要注册的项目目录").
+		CanChooseDirectories(true).
+		CanChooseFiles(false).
+		PromptForSingleSelection()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": path})
+}
+
+// --- 日志 ---
+
+func (a *api) handleReadLogs(w http.ResponseWriter, r *http.Request) {
+	state := currentState()
+	if state.LogPath == "" {
+		writeError(w, http.StatusInternalServerError, "无法定位日志路径")
+		return
+	}
+	offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+
+	file, err := os.Open(state.LogPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 服务还没启动过，日志文件尚不存在，这不是错误。
+			writeJSON(w, http.StatusOK, map[string]any{
+				"content": "", "offset": 0, "next_offset": 0, "size": 0,
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	size := info.Size()
+	// 日志被清空或轮转后，旧 offset 会越界，从头开始读。
+	if offset > size || offset < 0 {
+		offset = 0
+	}
+	if size-offset > maxLogChunk {
+		offset = size - maxLogChunk
+	}
+	buf := make([]byte, size-offset)
+	read, err := file.ReadAt(buf, offset)
+	if err != nil && read == 0 {
+		buf = buf[:0]
+		read = 0
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"content":     string(buf[:read]),
+		"offset":      offset,
+		"next_offset": offset + int64(read),
+		"size":        size,
+	})
+}
+
+func (a *api) handleClearLogs(w http.ResponseWriter, r *http.Request) {
+	state := currentState()
+	if state.LogPath == "" {
+		writeError(w, http.StatusInternalServerError, "无法定位日志路径")
+		return
+	}
+	if err := os.Truncate(state.LogPath, 0); err != nil && !os.IsNotExist(err) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- 基础连接配置 ---
+
+type connectionConfig struct {
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	AuthMode       string `json:"auth_mode"`
+	Token          string `json:"token"`
+	OAuthServerURL string `json:"oauth_server_url"`
+	// EffectiveMode 是 auth.mode 留空时服务端实际采用的模式，只读展示用。
+	EffectiveMode string `json:"effective_mode"`
+}
+
+func (a *api) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, err := config.LoadGlobal("")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("读取配置失败：%v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, connectionConfig{
+		Host:           cfg.Server.Host,
+		Port:           cfg.Server.Port,
+		AuthMode:       cfg.Auth.Mode,
+		Token:          cfg.Auth.Token,
+		OAuthServerURL: cfg.Auth.OAuth.ServerURL,
+		EffectiveMode:  config.EffectiveAuthMode(cfg.Auth),
+	})
+}
+
+// handlePutConfig 只改监听地址、鉴权与 OAuth 公网 Origin，其余配置（安全策略、保留策略等）
+// 一律不碰，仍然由用户手改 config.yaml。
+func (a *api) handlePutConfig(w http.ResponseWriter, r *http.Request) {
+	var body connectionConfig
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Port <= 0 || body.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "端口必须在 1-65535 之间")
+		return
+	}
+	switch body.AuthMode {
+	case "", "open", "bearer", "oauth", "dual":
+	default:
+		writeError(w, http.StatusBadRequest, "鉴权模式必须是 open / bearer / oauth / dual")
+		return
+	}
+
+	configPath, cfg, err := loadGlobalForWrite()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cfg.Server.Host = strings.TrimSpace(body.Host)
+	cfg.Server.Port = body.Port
+	cfg.Auth.Mode = body.AuthMode
+	cfg.Auth.Token = strings.TrimSpace(body.Token)
+	cfg.Auth.OAuth.ServerURL = strings.TrimRight(strings.TrimSpace(body.OAuthServerURL), "/")
+
+	if err := config.ValidateAuthMode(cfg.Auth); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := config.WriteGlobal(configPath, cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入配置失败：%v", err))
+		return
+	}
+	a.handleGetConfig(w, r)
+}
+
+// handleGenerateToken 只生成候选 Token 返回给前端，不直接落盘。
+// 用户在界面上确认后再走 PUT /config 写入。
+func (a *api) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": hex.EncodeToString(raw)})
+}
+
+// --- 杂项 ---
+
+// handleOpenPath 在资源管理器/默认程序中打开运行时目录或日志文件。
+func (a *api) handleOpenPath(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Target string `json:"target"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	app := a.application()
+	if app == nil {
+		writeError(w, http.StatusServiceUnavailable, "窗口尚未就绪")
+		return
+	}
+	state := currentState()
+	var path string
+	switch body.Target {
+	case "home":
+		path = state.HomeDir
+	case "log":
+		path = state.LogPath
+	case "config":
+		path = state.ConfigPath
+	case "cloudflare-log":
+		path = currentCloudflareState().LogPath
+	case "cloudflare-config":
+		path = currentCloudflareState().ConfigPath
+	default:
+		writeError(w, http.StatusBadRequest, "未知目标")
+		return
+	}
+	if path == "" {
+		writeError(w, http.StatusInternalServerError, "路径不可用")
+		return
+	}
+	if err := app.Browser.OpenFile(path); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- 共用辅助 ---
+
+func loadGlobalForWrite() (string, config.Config, error) {
+	configPath, err := config.GlobalConfigPath()
+	if err != nil {
+		return "", config.Config{}, err
+	}
+	cfg, err := config.LoadGlobal(configPath)
+	if err != nil {
+		return "", config.Config{}, fmt.Errorf("读取配置失败：%w", err)
+	}
+	return configPath, cfg, nil
+}
+
+// updateWorkspace 按名称修改工作区，并由配置层保留其他字段、注释和备份。
+func updateWorkspace(name string, mutate func(*config.WorkspaceEntry)) error {
+	configPath, cfg, err := loadGlobalForWrite()
+	if err != nil {
+		return err
+	}
+	for i := range cfg.Workspaces {
+		if cfg.Workspaces[i].Name == name {
+			mutate(&cfg.Workspaces[i])
+			if err := config.WriteGlobal(configPath, cfg); err != nil {
+				return fmt.Errorf("写入配置失败：%w", err)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("Workspace %q 不存在", name)
+}
+
+// decodeJSON 限制本地管理请求大小，拒绝多个 JSON 值，避免歧义和无限制分配内存。
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("请求格式错误：%v", err))
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "请求只能包含一个 JSON 对象")
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}

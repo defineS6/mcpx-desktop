@@ -1,0 +1,52 @@
+name: 验证与打包
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: internal/desktop/frontend/package-lock.json
+      - name: 检查 Go 格式
+        shell: pwsh
+        run: |
+          $files = @(gofmt -l ./cmd ./internal)
+          if ($files.Count -gt 0) { throw "以下文件需要 gofmt：$files" }
+      - name: 构建前端、测试并生成无控制台程序
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: 验证竞态
+        shell: pwsh
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./... -count=1
+      - name: 准备可下载归档
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release/package -Force | Out-Null
+          Copy-Item bin/mcpx-desktop.exe, LICENSE, NOTICE, README.md release/package/
+          Compress-Archive -Path release/package/* -DestinationPath release/mcpx-desktop-windows-amd64.zip
+          (Get-FileHash release/mcpx-desktop-windows-amd64.zip -Algorithm SHA256).Hash.ToLower() + '  mcpx-desktop-windows-amd64.zip' | Set-Content release/checksums.txt -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcpx-desktop-windows-amd64
+          path: |
+            release/mcpx-desktop-windows-amd64.zip
+            release/checksums.txt

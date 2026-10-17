@@ -1,0 +1,10 @@
+/bin/
+/release/
+*.exe
+*.test
+*.syso
+/internal/desktop/frontend/node_modules/
+/.mcpx/
+.env
+.env.*
+*.log
