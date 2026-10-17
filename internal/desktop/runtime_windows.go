@@ -110,7 +110,11 @@ func resolveRuntimePath() (string, error) {
 		}
 		return validateRuntimeFile(configured)
 	}
-	candidates := []string{filepath.Join(base, "mcpx.exe"), filepath.Join(base, "runtime", "mcpx.exe")}
+	candidates := []string{
+		filepath.Join(base, "mcpx-core.exe"),
+		filepath.Join(base, "runtime", "mcpx.exe"),
+		filepath.Join(base, "mcpx.exe"),
+	}
 	if found, err := exec.LookPath("mcpx.exe"); err == nil {
 		candidates = append(candidates, found)
 	}
@@ -119,7 +123,7 @@ func resolveRuntimePath() (string, error) {
 			return path, nil
 		}
 	}
-	return "", fmt.Errorf("未找到官方 mcpx.exe；请选择内核路径，或将它放在桌面管理器同目录")
+	return "", fmt.Errorf("未找到官方 MCPX 内核程序；请将官方内核命名为 mcpx-core.exe 置于同目录，或在界面中指定路径")
 }
 
 // validateRuntimeFile 校验文件及完整路径，拒绝把管理器当成内核造成递归启动。
