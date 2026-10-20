@@ -13,8 +13,23 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    # 推送 v* 标签时需要创建 Release，其余触发方式仍只读
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Release 正文要对比上一个标签，需要完整历史与标签
+          fetch-depth: 0
+      - name: 解析构建版本
+        id: version
+        shell: pwsh
+        run: |
+          # 标签构建取标签名（去掉 v 前缀），其它触发方式保留默认版本
+          $version = '0.1.0'
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $version = $env:GITHUB_REF -replace '^refs/tags/v', '' }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8NoBOM -Append
+          Write-Output "构建版本：$version"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -31,7 +46,7 @@ jobs:
           if ($files.Count -gt 0) { throw "以下文件需要 gofmt：$files" }
       - name: 构建前端、测试并生成无控制台程序
         shell: pwsh
-        run: ./scripts/build.ps1
+        run: ./scripts/build.ps1 -Version ${{ steps.version.outputs.value }}
       - name: 验证竞态
         shell: pwsh
         env:
@@ -50,3 +65,42 @@ jobs:
           path: |
             release/mcpx-desktop-windows-amd64.zip
             release/checksums.txt
+      - name: 生成 Release 正文
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          # 正文 = 固定说明 + 上一标签以来的提交；Markdown 行用单引号字符串，反引号原样保留
+          $prev = git tag --sort=-creatordate | Where-Object { $_ -ne $env:GITHUB_REF_NAME } | Select-Object -First 1
+          $range = if ($prev) { "$prev..$env:GITHUB_REF_NAME" } else { $env:GITHUB_REF_NAME }
+          $lines = @(
+            "Windows 桌面管理器 $env:VERSION。管理器不包含 MCP 服务端，需要单独下载的官方内核。",
+            '',
+            '## 下载',
+            '',
+            '- `mcpx-desktop-windows-amd64.zip`：解压得到 `mcpx-desktop.exe`，与官方 `mcpx.exe` 或 `mcpx-core.exe` 同目录使用。',
+            '- `checksums.txt`：SHA-256 校验值，可用 `Get-FileHash mcpx-desktop-windows-amd64.zip -Algorithm SHA256` 对比。',
+            '',
+            '## 要求',
+            '',
+            '- Windows 10/11 与 WebView2 Runtime。',
+            '- 官方 MCPX 内核单独下载；管理器只调用 `-version` 做版本检测，不内置也不替换内核。',
+            '',
+            '## 本版变更',
+            ''
+          )
+          $commits = @(git log $range --pretty='- %s (%h)')
+          if ($commits.Count -eq 0) { $commits = @('- 无新增提交') }
+          ($lines + $commits) -join "`n" | Set-Content release/release-notes.md -Encoding utf8NoBOM
+          Write-Output "Release 正文范围：$range"
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release/release-notes.md
+          files: |
+            release/mcpx-desktop-windows-amd64.zip
+            release/checksums.txt
+          fail_on_unmatched_files: true

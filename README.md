@@ -82,6 +82,8 @@ mcpx-desktop.exe
 
 发布版必须先生成前端资源协议清单。若资源缺失或仍为上游旧版，管理器会明确拒绝启动，不伪装成最新界面。
 
+`scripts/build.ps1` 接受 `-Version`（默认 `0.1.0`），用于写入 `mcpx-desktop -version`；CI 在 `v*` 标签构建时会把标签版本传进去，本地要编指定版本用 `.\scripts\build.ps1 -Version 0.2.0`。
+
 ### 不打包的开发预览
 
 在前端目录运行：
@@ -110,7 +112,7 @@ Remove-Item Env:\MCPX_TEST_RUNTIME
 
 该测试使用临时 `MCPX_HOME`、空闲端口和测试凭据，执行真实启动、MCP initialize、重启及停止；默认测试不会自动选择或操作现有服务。
 
-仓库的 GitHub Actions 在 Windows 上执行前端构建、Go 测试、竞态检测和打包，并上传可下载归档。工作流不自动发布 Release 或写回仓库。
+仓库的 GitHub Actions 在 Windows 上执行前端构建、Go 测试、竞态检测和打包，并上传可下载归档。推送 `v*` 标签时，工作流会去掉 `v` 前缀把标签版本写入 `mcpx-desktop -version`，并用该标签创建 GitHub Release（附 `mcpx-desktop-windows-amd64.zip` 与 `checksums.txt`，正文为下载/校验/内核要求说明加上一标签以来的提交列表）；其它触发方式只上传归档。工作流不写回仓库。
 
 ## 来源与许可
 
